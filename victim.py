@@ -6,11 +6,140 @@ import numpy as np
 import math
 from copy import deepcopy
 import matplotlib.pyplot as plt
-from robustbench.utils import load_model
+# from robustbench.utils import load_model
 device = torch.device('cuda:0')
 from utils import softmax, ece_score
 import os
 verbose = False
+
+##################################################################
+def load_model(model_name: str,
+               model_dir: Union[str, Path] = './models',
+               dataset: Union[str,
+                              BenchmarkDataset] = BenchmarkDataset.cifar_10,
+               threat_model: Union[str, ThreatModel] = ThreatModel.Linf,
+               custom_checkpoint: str = "",
+               norm: Optional[str] = None) -> nn.Module:
+    """Loads a model from the model_zoo.
+
+     The model is trained on the given ``dataset``, for the given ``threat_model``.
+
+    :param model_name: The name used in the model zoo.
+    :param model_dir: The base directory where the models are saved.
+    :param dataset: The dataset on which the model is trained.
+    :param threat_model: The threat model for which the model is trained.
+    :param norm: Deprecated argument that can be used in place of ``threat_model``. If specified, it
+      overrides ``threat_model``
+
+    :return: A ready-to-used trained model.
+    """
+    dataset_: BenchmarkDataset = BenchmarkDataset(dataset)
+    if norm is None:
+        # since there is only `corruptions` folder for models in the Model Zoo
+        threat_model = threat_model.replace('_3d', '')
+            
+        threat_model_: ThreatModel = ThreatModel(threat_model)
+    else:
+        threat_model_ = ThreatModel(norm)
+        warnings.warn(
+            "`norm` has been deprecated and will be removed in a future version.",
+            DeprecationWarning)
+
+    lower_model_name = model_name.lower().replace('-', '_')
+    timm_model_name = f"{lower_model_name}_{dataset_.value.lower()}_{threat_model_.value.lower()}"
+    
+    if timm.is_model(timm_model_name):
+        return timm.create_model(timm_model_name,
+                                 num_classes=DATASET_CLASSES[dataset_],
+                                 pretrained=True,
+                                 checkpoint_path=custom_checkpoint).eval()
+
+    model_dir_ = Path(model_dir) / dataset_.value / threat_model_.value
+    model_path = model_dir_ / f'{model_name}.pt'
+
+    models = all_models[dataset_][threat_model_]
+
+    if models[model_name]['gdrive_id'] is None:
+        raise ValueError(
+            f"Model `{model_name}` nor {timm_model_name} aren't a timm model and has no `gdrive_id` specified."
+        )
+
+    if not isinstance(models[model_name]['gdrive_id'], list):
+        model = models[model_name]['model']()
+        if dataset_ == BenchmarkDataset.imagenet and 'Standard' in model_name:
+            return model.eval()
+
+        if not os.path.exists(model_dir_):
+            os.makedirs(model_dir_)
+        if not os.path.isfile(model_path):
+            download_gdrive(models[model_name]['gdrive_id'], model_path)
+        checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
+
+        if 'Kireev2021Effectiveness' in model_name or model_name == 'Andriushchenko2020Understanding':
+            checkpoint = checkpoint[
+                'last']  # we take the last model (choices: 'last', 'best')
+        try:
+            # needed for the model of `Carmon2019Unlabeled`
+            state_dict = rm_substr_from_state_dict(checkpoint['state_dict'],
+                                                   'module.')
+            # needed for the model of `Chen2020Efficient`
+            state_dict = rm_substr_from_state_dict(state_dict, 'model.')
+        except:
+            state_dict = rm_substr_from_state_dict(checkpoint, 'module.')
+            state_dict = rm_substr_from_state_dict(state_dict, 'model.')
+
+        if dataset_ == BenchmarkDataset.imagenet:
+            # Some models need input normalization, which is added as extra layer.
+            if model_name not in [
+                'Singh2023Revisiting_ConvNeXt-T-ConvStem',
+                'Singh2023Revisiting_ViT-B-ConvStem',
+                'Singh2023Revisiting_ConvNeXt-S-ConvStem',
+                'Singh2023Revisiting_ConvNeXt-B-ConvStem',
+                'Singh2023Revisiting_ConvNeXt-L-ConvStem',
+                ]:
+                state_dict = add_substr_to_state_dict(state_dict, 'model.')
+
+        model = _safe_load_state_dict(model, model_name, state_dict, dataset_)
+
+        return model.eval()
+
+    # If we have an ensemble of models (e.g., Chen2020Adversarial, Diffenderfer2021Winning_LRR_CARD_Deck)
+    else:
+        model = models[model_name]['model']()
+        if not os.path.exists(model_dir_):
+            os.makedirs(model_dir_)
+        for i, gid in enumerate(models[model_name]['gdrive_id']):
+            if not os.path.isfile('{}_m{}.pt'.format(model_path, i)):
+                download_gdrive(gid, '{}_m{}.pt'.format(model_path, i))
+            checkpoint = torch.load('{}_m{}.pt'.format(model_path, i),
+                                    map_location=torch.device('cpu'))
+            try:
+                state_dict = rm_substr_from_state_dict(
+                    checkpoint['state_dict'], 'module.')
+            except KeyError:
+                state_dict = rm_substr_from_state_dict(checkpoint, 'module.')
+
+            if not model_name.startswith('Bai2023Improving'):
+                model.models[i] = _safe_load_state_dict(model.models[i],
+                                                        model_name, state_dict,
+                                                        dataset_)
+                model.models[i].eval()
+            else:
+                # TODO: make it cleaner.
+                if i < 2:
+                    model.comp_model.models[i] = _safe_load_state_dict(
+                        model.comp_model.models[i], model_name, state_dict, dataset_)
+                    model.comp_model.models[i].eval()
+                else:
+                    model.comp_model.policy_net = _safe_load_state_dict(
+                        model.comp_model.policy_net, model_name, state_dict['model'], dataset_)
+                    model.comp_model.bn = _safe_load_state_dict(
+                        model.comp_model.bn, model_name, state_dict['bn'], dataset_)
+
+        return model.eval()
+##################################################################
+
+
 
 def loss(y, logits, targeted=False, loss_type='margin_loss'):
     if loss_type == 'margin_loss':
